@@ -8,11 +8,16 @@
     {% if state.active_session %}<span class="badge on">有账号在线（单会话占用中）</span>
     {% else %}<span class="badge off">无活动会话</span>{% endif %}
   </td></tr>
+  <tr><th>流式导出计数</th><td>{{ state.export_streams_started }} 次（慢速正文模式下已开始发送正文的导出）</td></tr>
 </table>
 <form method="post" action="{{ url_for('admin') }}" style="margin-top:18px">
   <label style="display:block;margin:10px 0">
     <input type="checkbox" name="delay_export" {% if state.delay_export %}checked{% endif %} style="min-width:0">
     延迟导出（导出耗时约 8 秒，期间可演示取消）
+  </label>
+  <label style="display:block;margin:10px 0">
+    <input type="checkbox" name="slow_body" {% if state.slow_body %}checked{% endif %} style="min-width:0">
+    慢速正文（先发下载响应头、再持续缓慢发送正文，可演示下载开始后的取消）
   </label>
   <label style="display:block;margin:10px 0">
     <input type="checkbox" name="bad_file" {% if state.bad_file %}checked{% endif %} style="min-width:0">

@@ -61,7 +61,18 @@ class Worker(threading.Thread):
             shutil.rmtree(work_dir, ignore_errors=True)
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        bot = PortalBot(fresh, work_dir, cancel_event)
+        def note_download_started() -> None:
+            # 仅更新提示文案，状态仍为 running；若已在取消中则不动。
+            current = self.store.get_task(task_id)
+            if current and current["status"] == "running":
+                self.store.update(
+                    task_id,
+                    message="CSV 下载已开始，正在接收正文（取消将立即中断下载）",
+                )
+
+        bot = PortalBot(
+            fresh, work_dir, cancel_event, on_download_started=note_download_started
+        )
         downloaded: Path | None = None
         try:
             downloaded = bot.run()

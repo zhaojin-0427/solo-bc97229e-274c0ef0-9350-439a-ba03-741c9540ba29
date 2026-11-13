@@ -3,16 +3,20 @@
 运行前需要本机具备 Playwright Chromium（容器内由 browser 服务提供）。
 """
 import importlib.util
+import json
 import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from threading import Thread
-from wsgiref.simple_server import make_server
+
+from werkzeug.serving import make_server
 
 ROOT = Path(__file__).resolve().parents[1]
 PORTAL_PORT = 8123
@@ -45,7 +49,9 @@ except Exception:
 
 
 def _serve(app, port):
-    server = make_server("127.0.0.1", port, app)
+    # threaded=True：慢速正文流式响应不阻塞门户处理其他请求（如下一任务的登录），
+    # 采集服务的取消/状态查询也能并发响应。
+    server = make_server("127.0.0.1", port, app, threaded=True)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server
@@ -86,6 +92,8 @@ class IntegrationTest(unittest.TestCase):
             portal_module._state["session_token"] = None
             portal_module._state["delay_export"] = False
             portal_module._state["bad_file"] = False
+            portal_module._state["slow_body"] = False
+            portal_module._state["export_streams_started"] = 0
         portal_module.EXPORT_DELAY = 4
 
         cls.portal_server = _serve(portal_module.app, PORTAL_PORT)
@@ -120,8 +128,16 @@ class IntegrationTest(unittest.TestCase):
             time.sleep(0.5)
         raise AssertionError("上一用例的任务未在 60 秒内结束")
 
+    def tearDown(self):
+        # 故障开关与慢速正文参数一律复位，保证用例可重复、顺序无关。
+        with portal_module._state_lock:
+            portal_module._state["delay_export"] = False
+            portal_module._state["bad_file"] = False
+            portal_module._state["slow_body"] = False
+        portal_module.SLOW_BODY_CHUNK_DELAY = 0.5
+        portal_module.SLOW_BODY_CHUNK_SIZE = 64
+
     def _post(self, path, data=None):
-        import urllib.parse
         body = urllib.parse.urlencode(data or {}).encode()
         req = urllib.request.Request(
             BASE + path, data=body, method="POST",
@@ -130,7 +146,6 @@ class IntegrationTest(unittest.TestCase):
         with urllib.request.urlopen(req, timeout=10) as resp:
             payload = resp.read()
             try:
-                import json
                 return resp.status, json.loads(payload)
             except ValueError:
                 return resp.status, payload
@@ -142,7 +157,6 @@ class IntegrationTest(unittest.TestCase):
         return task
 
     def _get_json(self, path):
-        import json
         with urllib.request.urlopen(BASE + path, timeout=10) as resp:
             return json.loads(resp.read())
 
@@ -215,7 +229,6 @@ class IntegrationTest(unittest.TestCase):
             published = list(collector_config.PUBLISHED_DIR.glob(f"*{task_id}*"))
             self.assertEqual(published, [])
             # 下载接口必须拒绝
-            import urllib.error
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 urllib.request.urlopen(f"{BASE}/tasks/{task_id}/download", timeout=10)
             self.assertEqual(ctx.exception.code, 409)
@@ -268,6 +281,124 @@ class IntegrationTest(unittest.TestCase):
         retried = self._wait_status(new_id, "published", timeout=60)
         self.assertEqual(retried["retry_of"], bad_id)
         self.assertEqual(retried["attempts"], 2)
+
+    # ------------------------------------------------------------------
+    def _enable_slow_body(self, chunk_delay, chunk_size):
+        portal_module.SLOW_BODY_CHUNK_DELAY = chunk_delay
+        portal_module.SLOW_BODY_CHUNK_SIZE = chunk_size
+        with portal_module._state_lock:
+            portal_module._state["slow_body"] = True
+
+    def _streams_started(self):
+        with portal_module._state_lock:
+            return portal_module._state["export_streams_started"]
+
+    def _wait_stream_started(self, baseline, timeout=30):
+        """等到门户真正开始流式发送正文（响应头已发出、正文传输中）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._streams_started() > baseline:
+                return
+            time.sleep(0.2)
+        raise AssertionError("门户迟迟未开始发送下载正文")
+
+    def _wait_message(self, task_id, fragment, timeout=30):
+        """等到任务提示文案包含指定片段（用于确认采集端已进入正文接收阶段）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            task = self._get_json(f"/api/tasks/{task_id}")
+            if fragment in task["message"]:
+                return task
+            time.sleep(0.2)
+        raise AssertionError(f"任务 {task_id} 迟迟未出现提示：{fragment}")
+
+    def test_06_cancel_after_download_started_aborts_and_queue_continues(self):
+        """回归：下载已开始（响应头已发、正文缓慢传输中）时取消——
+        必须立即中断在途下载、清理未发布文件，后续任务照常采集发布。"""
+        # 正文约需 20+ 秒才能传完；若取消退化为“等正文传完”，本用例会超时失败。
+        self._enable_slow_body(chunk_delay=2.0, chunk_size=32)
+        baseline = self._streams_started()
+
+        t1 = self._create_task("A线", "2026-11-13")
+        self._wait_status(t1["id"], "running", timeout=30)
+        # 确认下载真的开始了（门户已发出响应头、正在缓慢发送正文），
+        # 且采集端已进入正文接收阶段——取消必然落在正文传输中途。
+        self._wait_stream_started(baseline)
+        self._wait_message(t1["id"], "正在接收正文")
+
+        # 取消请求必须快速响应，不能被在途下载拖住
+        cancel_t0 = time.monotonic()
+        status, payload = self._post(f"/api/tasks/{t1['id']}/cancel", {})
+        cancel_rtt = time.monotonic() - cancel_t0
+        self.assertEqual(status, 200, payload)
+        self.assertLess(cancel_rtt, 5.0, "取消请求响应被下载阻塞")
+
+        # 取消受理后立刻排入后续任务
+        t2 = self._create_task("B线", "2026-11-13")
+
+        # 取消处理期间状态查询保持响应
+        query_t0 = time.monotonic()
+        mid = self._get_json(f"/api/tasks/{t1['id']}")
+        self.assertLess(time.monotonic() - query_t0, 5.0, "状态查询被下载阻塞")
+        self.assertIn(mid["status"], ("cancelling", "cancelled"))
+
+        # 任务必须快速进入已取消，而不是等 20+ 秒正文传完
+        cancelled = self._wait_status(t1["id"], "cancelled", timeout=10)
+        self.assertLess(
+            time.monotonic() - cancel_t0, 10.0,
+            "取消未在正文传完前生效，疑似仍在等待后台下载",
+        )
+        self.assertIn("删除未发布文件", cancelled["message"])
+
+        # 迟到数据不得发布：无发布文件、工作目录清除、下载接口 409
+        self.assertFalse((collector_config.WORK_DIR / t1["id"]).exists())
+        self.assertEqual(
+            list(collector_config.PUBLISHED_DIR.glob(f"*{t1['id']}*")), []
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(f"{BASE}/tasks/{t1['id']}/download", timeout=10)
+        self.assertEqual(ctx.exception.code, 409)
+
+        # 队列接续：后续任务接管门户会话，正常采集、校验、发布
+        with portal_module._state_lock:
+            portal_module._state["slow_body"] = False  # t2 全速下载即可
+        done = self._wait_status(t2["id"], "published", timeout=60)
+        self.assertTrue(done["published_file"])
+        # 单会话串行：t2 只能在 t1 结束后才开始
+        self.assertGreaterEqual(done["started_at"], cancelled["finished_at"])
+
+        with urllib.request.urlopen(
+            f"{BASE}/tasks/{t2['id']}/download", timeout=10
+        ) as resp:
+            payload = resp.read().decode("utf-8-sig")
+        self.assertIn("产线,日期,样品号,测量值", payload)
+        self.assertTrue(
+            all(
+                ln.startswith("B线,2026-11-13,")
+                for ln in payload.splitlines()[1:]
+                if ln.strip()
+            )
+        )
+
+    def test_07_slow_body_download_completes_when_not_cancelled(self):
+        """慢速正文本身不是错误：不取消时应完整收完正文并正常发布。"""
+        self._enable_slow_body(chunk_delay=0.15, chunk_size=32)
+        task = self._create_task("C线", "2026-11-13")
+        done = self._wait_status(task["id"], "published", timeout=60)
+        self.assertTrue(done["published_file"])
+
+        with urllib.request.urlopen(
+            f"{BASE}/tasks/{task['id']}/download", timeout=10
+        ) as resp:
+            payload = resp.read().decode("utf-8-sig")
+        self.assertIn("产线,日期,样品号,测量值", payload)
+        self.assertTrue(
+            all(
+                ln.startswith("C线,2026-11-13,")
+                for ln in payload.splitlines()[1:]
+                if ln.strip()
+            )
+        )
 
 
 if __name__ == "__main__":

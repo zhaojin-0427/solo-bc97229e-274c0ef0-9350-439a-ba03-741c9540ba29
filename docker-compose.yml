@@ -7,7 +7,10 @@ services:
       PORTAL_PASSWORD: instrument123
       PORTAL_DELAY_EXPORT: "0"
       PORTAL_BAD_FILE: "0"
+      PORTAL_SLOW_BODY: "0"
       PORTAL_EXPORT_DELAY: "8"
+      PORTAL_SLOW_BODY_DELAY: "0.5"
+      PORTAL_SLOW_BODY_CHUNK: "64"
     ports:
       - "8000:8000"
     healthcheck:

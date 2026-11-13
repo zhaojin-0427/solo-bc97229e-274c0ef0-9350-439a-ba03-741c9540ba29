@@ -3,7 +3,9 @@
 特性：
 - 账号全局只允许一个会话，新登录会把旧会话踢下线（对应真实门户的单会话限制）。
 - 按产线 + 日期筛选检测明细，导出 CSV（中文表头：产线,日期,样品号,测量值）。
-- 可通过环境变量或 /admin 页面切换「延迟导出」和「返回错误产线文件」两种故障模式。
+- 可通过环境变量或 /admin 页面切换三种故障模式：「延迟导出」、
+  「返回错误产线文件」和「慢速正文」（先发下载响应头，再持续缓慢发送正文，
+  用于复现下载开始后取消的场景）。
 """
 from __future__ import annotations
 
@@ -34,6 +36,9 @@ USERNAME = os.environ.get("PORTAL_USERNAME", "admin")
 PASSWORD = os.environ.get("PORTAL_PASSWORD", "instrument123")
 # 导出动作的人工延迟（秒），由「延迟导出」开关启用。
 EXPORT_DELAY = float(os.environ.get("PORTAL_EXPORT_DELAY", "8"))
+# 「慢速正文」模式：响应头与首块立即发出，之后每块间隔该秒数缓慢发送。
+SLOW_BODY_CHUNK_DELAY = float(os.environ.get("PORTAL_SLOW_BODY_DELAY", "0.5"))
+SLOW_BODY_CHUNK_SIZE = int(os.environ.get("PORTAL_SLOW_BODY_CHUNK", "64"))
 
 LINES = ["A线", "B线", "C线"]
 
@@ -43,6 +48,9 @@ _state = {
     "session_token": None,   # 当前唯一有效会话
     "delay_export": os.environ.get("PORTAL_DELAY_EXPORT", "0") == "1",
     "bad_file": os.environ.get("PORTAL_BAD_FILE", "0") == "1",
+    "slow_body": os.environ.get("PORTAL_SLOW_BODY", "0") == "1",
+    # 观测计数：已开始流式发送正文的导出次数（演示与回归测试用）。
+    "export_streams_started": 0,
 }
 
 
@@ -126,7 +134,7 @@ def _read_filter() -> tuple[str | None, str | None, str | None]:
     return line, day, None
 
 
-def _csv_response(line: str, day: str, *, bad_line: bool) -> Response:
+def _csv_payload(line: str, day: str, *, bad_line: bool) -> bytes:
     # 错误产线文件：表头正确，但数据里混入其他产线，用于触发采集端校验拦截。
     actual_line = "X线" if bad_line else line
     rows = _generate_records(actual_line, day)
@@ -136,7 +144,10 @@ def _csv_response(line: str, day: str, *, bad_line: bool) -> Response:
     writer = csv.DictWriter(buf, fieldnames=["产线", "日期", "样品号", "测量值"])
     writer.writeheader()
     writer.writerows(rows)
-    payload = "﻿" + buf.getvalue()  # 带 BOM，模拟仪器门户常见导出格式
+    return ("﻿" + buf.getvalue()).encode("utf-8")  # 带 BOM，模拟仪器门户常见导出格式
+
+
+def _csv_headers(line: str, day: str) -> dict[str, str]:
     # 头部必须是 latin-1 安全的 ASCII：文件名走 RFC 5987 的 filename* 承载中文。
     ascii_name = f"inspection_{hashlib.sha1(f'{line}|{day}'.encode()).hexdigest()[:10]}.csv"
     utf8_name = f"inspection_{line}_{day}.csv"
@@ -144,10 +155,34 @@ def _csv_response(line: str, day: str, *, bad_line: bool) -> Response:
         f"attachment; filename=\"{ascii_name}\"; "
         f"filename*=UTF-8''{quote(utf8_name)}"
     )
+    return {"Content-Disposition": disposition}
+
+
+def _csv_response(line: str, day: str, *, bad_line: bool, slow_body: bool) -> Response:
+    payload = _csv_payload(line, day, bad_line=bad_line)
+    headers = _csv_headers(line, day)
+    if not slow_body:
+        return Response(
+            payload,
+            mimetype="text/csv; charset=utf-8",
+            headers=headers,
+        )
+
+    def stream():
+        with _state_lock:
+            _state["export_streams_started"] += 1
+        # 首块立即吐出：浏览器先收到响应头、下载随即开始；
+        # 之后正文按固定间隔逐块缓慢发送，模拟源站大文件/慢速链路。
+        for offset in range(0, len(payload), SLOW_BODY_CHUNK_SIZE):
+            if offset:
+                time.sleep(SLOW_BODY_CHUNK_DELAY)
+            yield payload[offset:offset + SLOW_BODY_CHUNK_SIZE]
+
+    # 不设 Content-Length，服务器按 chunked/连接关闭界定正文，大小对端不可预知。
     return Response(
-        payload.encode("utf-8"),
+        stream(),
         mimetype="text/csv; charset=utf-8",
-        headers={"Content-Disposition": disposition},
+        headers=headers,
     )
 
 
@@ -176,6 +211,7 @@ def export():
     with _state_lock:
         delay = _state["delay_export"]
         bad = _state["bad_file"]
+        slow = _state["slow_body"]
         delay_seconds = EXPORT_DELAY if delay else 0.0
     if delay_seconds:
         # 分段睡眠，门户被挤下线时可以更快返回错误，而不是干等。
@@ -187,7 +223,7 @@ def export():
             time.sleep(min(0.5, deadline - time.monotonic()))
     if not _is_logged_in():
         return redirect(url_for("login"))
-    return _csv_response(line, day, bad_line=bad)
+    return _csv_response(line, day, bad_line=bad, slow_body=slow)
 
 
 @app.route("/admin", methods=["GET", "POST"])
@@ -197,6 +233,7 @@ def admin():
         with _state_lock:
             _state["delay_export"] = request.form.get("delay_export") == "on"
             _state["bad_file"] = request.form.get("bad_file") == "on"
+            _state["slow_body"] = request.form.get("slow_body") == "on"
         flash("门户故障模式已更新。", "ok")
         return redirect(url_for("admin"))
     with _state_lock:

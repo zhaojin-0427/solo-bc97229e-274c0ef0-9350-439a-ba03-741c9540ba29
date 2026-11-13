@@ -1,6 +1,7 @@
 """模拟门户功能测试（Flask 测试客户端，无需浏览器）。"""
 import importlib.util
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,16 @@ class PortalTest(unittest.TestCase):
             portal_module._state["session_token"] = None
             portal_module._state["delay_export"] = False
             portal_module._state["bad_file"] = False
+            portal_module._state["slow_body"] = False
+            portal_module._state["export_streams_started"] = 0
+        self._old_delay = portal_module.SLOW_BODY_CHUNK_DELAY
+        self._old_size = portal_module.SLOW_BODY_CHUNK_SIZE
+
+    def tearDown(self):
+        portal_module.SLOW_BODY_CHUNK_DELAY = self._old_delay
+        portal_module.SLOW_BODY_CHUNK_SIZE = self._old_size
+        with portal_module._state_lock:
+            portal_module._state["slow_body"] = False
 
     def _login(self):
         return self.client.post(
@@ -90,6 +101,57 @@ class PortalTest(unittest.TestCase):
         with portal_module._state_lock:
             self.assertTrue(portal_module._state["delay_export"])
             self.assertFalse(portal_module._state["bad_file"])
+            self.assertFalse(portal_module._state["slow_body"])
+
+    def test_admin_toggles_slow_body(self):
+        resp = self.client.post(
+            "/admin", data={"slow_body": "on"}, follow_redirects=True
+        )
+        self.assertEqual(resp.status_code, 200)
+        with portal_module._state_lock:
+            self.assertTrue(portal_module._state["slow_body"])
+            self.assertFalse(portal_module._state["delay_export"])
+
+    def test_slow_body_sends_headers_first_then_trickles(self):
+        """慢速正文模式：响应头/首块立即到达，正文分块缓慢发送且内容完整。"""
+        with portal_module._state_lock:
+            portal_module._state["slow_body"] = True
+        portal_module.SLOW_BODY_CHUNK_DELAY = 0.2
+        portal_module.SLOW_BODY_CHUNK_SIZE = 16
+        self._login()
+
+        t0 = time.monotonic()
+        resp = self.client.post(
+            "/export",
+            data={"line": "A线", "date": "2026-11-10"},
+            buffered=False,
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("text/csv", resp.headers["Content-Type"])
+        self.assertIn("attachment", resp.headers["Content-Disposition"])
+        # 流式正文不预设 Content-Length
+        self.assertNotIn("Content-Length", resp.headers)
+
+        chunks = iter(resp.response)
+        first = next(chunks)  # 首块（触发响应头发送）应立即到达
+        first_elapsed = time.monotonic() - t0
+        self.assertLess(first_elapsed, 2.0, "首块未及时到达，未体现先发下载头")
+
+        rest = b"".join(chunks)
+        total = time.monotonic() - t0
+        # 正文逐块缓慢发送，整体耗时明显大于首块到达时间
+        self.assertGreater(total, first_elapsed + 0.4)
+        resp.close()
+
+        with portal_module._state_lock:
+            self.assertEqual(portal_module._state["export_streams_started"], 1)
+
+        text = (first + rest).decode("utf-8-sig")
+        self.assertIn("产线,日期,样品号,测量值", text)
+        data_lines = [ln for ln in text.splitlines()[1:] if ln.strip()]
+        self.assertTrue(data_lines)
+        for ln in data_lines:
+            self.assertTrue(ln.startswith("A线,2026-11-10,"), ln)
 
 
 if __name__ == "__main__":
